@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "user_exit_info.h": "c",
+        "queue.h": "c",
+        "assert.h": "c"
+    }
+}
