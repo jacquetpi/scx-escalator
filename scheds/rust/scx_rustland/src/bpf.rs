@@ -24,6 +24,12 @@ use scx_utils::uei_report;
 // Defined in UAPI
 const SCHED_EXT: i32 = 7;
 
+// Do not assign any specific CPU to the task.
+//
+// The task will be dispatched to the global shared DSQ and it will run on the first CPU available.
+#[allow(dead_code)]
+pub const NO_CPU: i32 = -1;
+
 /// scx_rustland: provide high-level abstractions to interact with the BPF component.
 ///
 /// Overview
@@ -124,23 +130,12 @@ const SCHED_EXT: i32 = 7;
 /// }
 ///
 
-// Override default memory allocator.
-//
-// To prevent potential deadlock conditions under heavy loads, any scheduler that delegates
-// scheduling decisions to user-space should avoid triggering page faults.
-//
-// To address this issue, replace the global allocator with a custom one (RustLandAllocator),
-// designed to operate on a pre-allocated buffer. This, coupled with the memory locking achieved
-// through mlockall(), prevents page faults from occurring during the execution of the user-space
-// scheduler.
-#[global_allocator]
-static ALLOCATOR: RustLandAllocator = RustLandAllocator;
-
 // Task queued for scheduling from the BPF component (see bpf_intf::queued_task_ctx).
 #[derive(Debug)]
 pub struct QueuedTask {
     pub pid: i32,              // pid that uniquely identifies a task
     pub cpu: i32,              // CPU where the task is running (-1 = exiting)
+    pub cpumask_cnt: u64,      // cpumask generation counter
     pub sum_exec_runtime: u64, // Total cpu time
     pub nvcsw: u64,            // Voluntary context switches
     pub weight: u64,           // Task static priority
@@ -149,9 +144,10 @@ pub struct QueuedTask {
 // Task queued for dispatching to the BPF component (see bpf_intf::dispatched_task_ctx).
 #[derive(Debug)]
 pub struct DispatchedTask {
-    pub pid: i32,     // pid that uniquely identifies a task
-    pub cpu: i32,     // target CPU selected by the scheduler
-    pub payload: u64, // task payload (used for debugging)
+    pub pid: i32,              // pid that uniquely identifies a task
+    pub cpu: i32,              // target CPU selected by the scheduler
+    pub cpumask_cnt: u64,      // cpumask generation counter
+    pub payload: u64,          // task payload (used for debugging)
 }
 
 // Message received from the dispatcher (see bpf_intf::queued_task_ctx for details).
@@ -173,6 +169,7 @@ impl EnqueuedMessage {
         QueuedTask {
             pid: self.inner.pid,
             cpu: self.inner.cpu,
+            cpumask_cnt: self.inner.cpumask_cnt,
             sum_exec_runtime: self.inner.sum_exec_runtime,
             nvcsw: self.inner.nvcsw,
             weight: self.inner.weight,
@@ -192,6 +189,7 @@ impl DispatchedMessage {
         let dispatched_task_struct = bpf_intf::dispatched_task_ctx {
             pid: task.pid,
             cpu: task.cpu,
+            cpumask_cnt: task.cpumask_cnt,
             payload: task.payload,
         };
         DispatchedMessage {
@@ -294,6 +292,18 @@ impl<'a> BpfScheduler<'a> {
         &mut self.skel.bss_mut().nr_kernel_dispatches
     }
 
+    // Counter of cancel dispatch events.
+    #[allow(dead_code)]
+    pub fn nr_cancel_dispatches_mut(&mut self) -> &mut u64 {
+        &mut self.skel.bss_mut().nr_cancel_dispatches
+    }
+
+    // Counter of dispatches bounced to the shared DSQ.
+    #[allow(dead_code)]
+    pub fn nr_bounce_dispatches_mut(&mut self) -> &mut u64 {
+        &mut self.skel.bss_mut().nr_bounce_dispatches
+    }
+
     // Counter of failed dispatch events.
     #[allow(dead_code)]
     pub fn nr_failed_dispatches_mut(&mut self) -> &mut u64 {
@@ -360,13 +370,13 @@ impl<'a> BpfScheduler<'a> {
 
     // Read exit code from the BPF part.
     pub fn exited(&mut self) -> bool {
-	uei_exited!(&self.skel.bss().uei)
+        uei_exited!(&self.skel.bss().uei)
     }
 
     // Called on exit to shutdown and report exit message from the BPF part.
     pub fn shutdown_and_report(&mut self) -> Result<()> {
-	self.struct_ops.take();
-	uei_report!(self.skel.bss().uei)
+        self.struct_ops.take();
+        uei_report!(self.skel.bss().uei)
     }
 }
 
